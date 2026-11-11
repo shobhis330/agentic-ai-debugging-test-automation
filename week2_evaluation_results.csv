@@ -1,0 +1,46 @@
+case,status,bug_type,explanation,confidence,attempts,details
+TC01,REPAIRED,Logical Error in Mathematical Calculation and Edge Case Handling,"The function was incorrectly dividing the total sum by `len(numbers) - 1` instead of `len(numbers)`, which caused incorrect mathematical averages for normal lists and a ZeroDivisionError when the list contained only one element. Additionally, it lacked a check for empty lists to raise a ValueError as expected by the test suite.",1.0,1,"....                                                                     [100%]
+4 passed in 0.02s
+"
+TC02,REPAIRED,Off-by-one error (Logical boundary condition error),"The function checks if `age > 18`, which returns `False` for an age of 18. By legal definition in many contexts (and as tested by `test_exactly_18`), a person who is 18 years old is considered an adult, meaning the condition should be `age >= 18`.",1.0,1,"...                                                                      [100%]
+3 passed in 0.02s
+"
+TC03,REPAIRED,NameError,"The function attempts to return 'tota' instead of the defined variable 'total', leading to a NameError because 'tota' is undefined.",1.0,1,"...                                                                      [100%]
+3 passed in 0.02s
+"
+TC04,REPAIRED,Arithmetic Error,"The function was adding the discount to the total instead of subtracting it. A discount reduces the total invoice amount, so it should be subtracted from the subtotal and tax sum.",1.0,1,"........                                                                 [100%]
+8 passed in 0.03s
+"
+TC05,REPAIRED,Missing validation logic,"The function `reserve_stock` directly subtracts the requested amount from the stock without checking if the requested amount exceeds the available stock. As a result, when insufficient stock is requested, it does not raise a `ValueError` as expected by the tests.",1.0,1,".........                                                                [100%]
+9 passed in 0.03s
+"
+TC06,REPAIRED,Incomplete validation logic,"The original function only checks if the length of the password is at least 8 characters. It fails to check for uppercase letters, lowercase letters, digits, and special characters, which are required by the test cases.",1.0,1,"........                                                                 [100%]
+8 passed in 0.03s
+"
+TC07,REPAIRED,Off-by-one error / Indexing calculation error,"The pagination function uses 1-based indexing for the `page` parameter (e.g., page 1 expects the first items), but it calculates the start index directly as `page * page_size`. For page 1 with a size of 3, this results in `1 * 3 = 3`, skipping the first 3 items and returning items starting from index 3 instead of index 0. To fix this, the page number should be converted to a 0-based index by subtracting 1 before multiplying by `page_size` (i.e., `(page - 1) * page_size`).",1.0,1,"........                                                                 [100%]
+8 passed in 0.03s
+"
+TC08,REPAIRED,Logic error / Incorrect business logic,"The original function `calculate_shipping` multiplies the weight by a flat rate of 5 regardless of the shipping zone. The test cases indicate that different shipping zones have different rates per unit of weight ('local' costs 5 per unit, 'regional' costs 8 per unit, and 'national' costs 12 per unit). The function needs to check the zone and apply the corresponding rate.",1.0,1,"........                                                                 [100%]
+8 passed in 0.04s
+"
+TC09,REPAIRED,Missing whitespace stripping,"The `normalize_email` function only converts the email string to lowercase using `.lower()`, but it fails to remove leading and trailing whitespace. The test cases include emails with surrounding spaces (e.g., `' User@Example.COM '`), causing assertions to fail because the whitespace remains in the output.",1.0,1,"........                                                                 [100%]
+8 passed in 0.04s
+"
+TC10,REPAIRED,Logic error in exponential backoff calculation for zero/negative attempts,"The test case expects `calculate_retry_delay(0, 2, 30)` to return `2`, but the formula `base * (2 ** (attempt - 1))` results in `2 * (2 ** (0 - 1)) = 2 * (2 ** -1) = 1.0` when `attempt` is 0. Retry attempts usually start at 1, but if attempt 0 is passed and expected to behave like attempt 1 (or if `attempt` represents the number of previous failures and should be treated with a minimum floor), the exponent calculation needs adjustment.",0.99,1,"........                                                                 [100%]
+8 passed in 0.03s
+"
+TC11,REPAIRED,Incorrect CSV parsing logic,"The original implementation simply splits the input string by commas (`line.split(',')`). This fails when commas are inside quoted fields (e.g., '""Doe, Jane"",30,NY') and when handling empty strings (where `"""".split(',')` returns `['']` instead of `[]`). We can fix this by using Python's built-in `csv` module to correctly parse the CSV row.",0.99,1,"........                                                                 [100%]
+8 passed in 0.05s
+"
+TC12,ALREADY_PASSED,,All tests passed initially.,1,0,"........                                                                 [100%]
+8 passed in 0.04s
+"
+TC13,REPAIRED,Insufficient Validation Logic,"The original function only checks if the keys 'name' and 'email' are present in the payload. It does not validate their types, check if strings are non-empty, ensure valid email formatting (e.g., presence of '@'), or validate the type and presence of optional fields like 'age'.",1.0,1,"........                                                                 [100%]
+8 passed in 0.03s
+"
+TC14,ALREADY_PASSED,,All tests passed initially.,1,0,"........                                                                 [100%]
+8 passed in 0.05s
+"
+TC15,ALREADY_PASSED,,All tests passed initially.,1,0,"........                                                                 [100%]
+8 passed in 0.05s
+"

@@ -1,12 +1,17 @@
 
-import sys
-import shutil
-import tempfile
+import ast
 import difflib
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
+from google import genai
 
 # ==========================================================
 # PROJECT CONFIGURATION
@@ -26,7 +31,7 @@ from core.test_runner import run_tests, validate_python_code
 
 
 st.set_page_config(
-    page_title="Agentic AI Python Debugging System",
+    page_title="DebugEngage AI",
     page_icon="🐞",
     layout="wide",
 )
@@ -45,10 +50,14 @@ DEFAULT_STATE = {
     "repair_file": None,
     "repair_applied": False,
     "post_repair_result": None,
+
     "single_source_code": "",
     "single_file_name": "solution.py",
     "single_diagnosis": None,
-    "single_validation": None,
+    "single_test_code": "",
+    "single_test_explanation": "",
+    "single_test_result": None,
+    "single_comparison_result": None,
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -57,22 +66,25 @@ for key, value in DEFAULT_STATE.items():
 
 
 # ==========================================================
-# HELPER FUNCTIONS
+# GENERAL HELPERS
 # ==========================================================
 
-def clear_single_code():
+def reset_single_file_results():
+    st.session_state.single_diagnosis = None
+    st.session_state.single_test_code = ""
+    st.session_state.single_test_explanation = ""
+    st.session_state.single_test_result = None
+    st.session_state.single_comparison_result = None
 
-    # Streamlit runs this callback before recreating the widgets,
-    # so it is safe to update their session-state values here.
-    st.session_state["single_source_code"] = ""
-    st.session_state["single_file_name"] = "solution.py"
-    st.session_state["single_file_name_input"] = "solution.py"
-    st.session_state["single_diagnosis"] = None
-    st.session_state["single_validation"] = None
+
+def clear_single_code():
+    st.session_state.single_source_code = ""
+    st.session_state.single_file_name = "solution.py"
+    st.session_state.single_file_name_input = "solution.py"
+    reset_single_file_results()
 
 
 def reset_project_state():
-
     old_workspace = st.session_state.get("workspace")
 
     if old_workspace:
@@ -92,25 +104,17 @@ def reset_project_state():
 
 
 def get_project_files(project_path):
-
     project_path = Path(project_path).resolve()
 
     ignored = {
-        ".venv",
-        "venv",
-        ".git",
-        "__pycache__",
-        "node_modules",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".tox",
-        "site-packages",
+        ".venv", "venv", ".git", "__pycache__",
+        "node_modules", ".pytest_cache", ".mypy_cache",
+        ".tox", "site-packages",
     }
 
     files = []
 
     for path in project_path.rglob("*.py"):
-
         relative_parts = path.relative_to(project_path).parts
 
         if any(part in ignored for part in relative_parts):
@@ -123,7 +127,6 @@ def get_project_files(project_path):
 
 
 def get_relative_path(file_path, project_path):
-
     return str(
         Path(file_path).resolve().relative_to(
             Path(project_path).resolve()
@@ -132,52 +135,33 @@ def get_relative_path(file_path, project_path):
 
 
 def resolve_project_file(project_path, relative_file_path):
-
-    project_root = Path(project_path).resolve()
-
-    candidate = (
-        project_root / relative_file_path
-    ).resolve()
+    root = Path(project_path).resolve()
+    candidate = (root / relative_file_path).resolve()
 
     try:
-        candidate.relative_to(project_root)
-
+        candidate.relative_to(root)
     except ValueError as error:
         raise ValueError(
             "Selected file is outside the project folder."
         ) from error
 
-    if not candidate.is_file():
+    if not candidate.is_file() or candidate.suffix.lower() != ".py":
         raise FileNotFoundError(
             "Selected Python file does not exist."
-        )
-
-    if candidate.suffix.lower() != ".py":
-        raise ValueError(
-            "Only Python files can be selected."
         )
 
     return candidate
 
 
 def get_test_output(result):
-
     if not result:
         return ""
-
-    return str(
-        result.get(
-            "output",
-            "No test output available."
-        )
-    )
+    return str(result.get("output", "No test output available."))
 
 
 def format_confidence(value):
-
     try:
         confidence = float(value)
-
     except (TypeError, ValueError):
         return "Not specified"
 
@@ -188,7 +172,6 @@ def format_confidence(value):
 
 
 def is_valid_repair(diagnosis):
-
     if not isinstance(diagnosis, dict):
         return False
 
@@ -202,7 +185,6 @@ def is_valid_repair(diagnosis):
 
 
 def validate_repair_code(diagnosis, file_name):
-
     if not is_valid_repair(diagnosis):
         return False
 
@@ -215,11 +197,234 @@ def validate_repair_code(diagnosis, file_name):
 
 
 # ==========================================================
+# PYTEST GENERATION
+# ==========================================================
+
+def generate_pytest_tests(
+    original_code,
+    corrected_code,
+    file_name,
+    diagnosis,
+):
+    """
+    Generate tests intended to distinguish the original
+    implementation from the proposed corrected implementation.
+    """
+
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured. "
+            "Add it to your .env file."
+        )
+
+    module_name = Path(file_name).stem
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", module_name):
+        module_name = "solution"
+
+    client = genai.Client(api_key=api_key)
+
+    prompt = f"""
+You are an expert Python software test engineer.
+
+Create pytest tests for the intended correct behaviour of the
+Python program.
+
+The same test file will be run against BOTH:
+1. The original source code.
+2. The proposed corrected source code.
+
+The purpose is to check whether the proposed correction fixes
+the defects identified in the diagnosis.
+
+Module name: {module_name}
+
+ORIGINAL SOURCE:
+{original_code}
+
+PROPOSED CORRECTED SOURCE:
+{corrected_code}
+
+AI DIAGNOSIS:
+{json.dumps(diagnosis, ensure_ascii=False, default=str)}
+
+Requirements:
+- Generate independent pytest functions named test_*.
+- Test normal cases and meaningful edge cases.
+- Tests should express the intended correct behaviour.
+- Do not write tests that deliberately expect known bugs.
+- Do not simply copy the implementation's behaviour as the expected result.
+- Use the diagnosis to understand what behaviour should be corrected.
+- Import from {module_name}.
+- Do not use network access, subprocesses, file deletion,
+  or unrelated system actions.
+- Do not include markdown fences.
+- Return only valid JSON with:
+  "test_code": complete pytest test file as a string
+  "explanation": short test coverage description
+"""
+
+    response = client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=prompt,
+        config={"response_mime_type": "application/json"},
+    )
+
+    response_text = getattr(response, "text", None)
+
+    if not response_text:
+        raise ValueError(
+            "Gemini returned an empty test-generation response."
+        )
+
+    try:
+        result = json.loads(response_text)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "Gemini returned invalid JSON while generating tests."
+        ) from error
+
+    test_code = result.get("test_code", "")
+
+    if not isinstance(test_code, str) or not test_code.strip():
+        raise ValueError(
+            "Gemini did not generate valid pytest code."
+        )
+
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError as error:
+        raise ValueError(
+            f"Generated tests have a syntax error: {error}"
+        ) from error
+
+    test_functions = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    ]
+
+    if not test_functions:
+        raise ValueError(
+            "Gemini did not generate any pytest test functions."
+        )
+
+    return {
+        "test_code": test_code,
+        "explanation": str(result.get("explanation", "")),
+    }
+
+
+# ==========================================================
+# SINGLE-FILE TEST EXECUTION
+# ==========================================================
+
+def run_single_file_tests(source_code, file_name, test_code):
+    """
+    Run pytest against a temporary copy of a Python file.
+    The original local file is not modified.
+    """
+
+    if not source_code.strip():
+        raise ValueError("The Python source code is empty.")
+
+    if not test_code.strip():
+        raise ValueError("The pytest test code is empty.")
+
+    if len(source_code) > 100000:
+        raise ValueError(
+            "The source file exceeds 100,000 characters."
+        )
+
+    if len(test_code) > 100000:
+        raise ValueError(
+            "The test file exceeds 100,000 characters."
+        )
+
+    source_validation = validate_python_code(
+        source_code,
+        file_name,
+    )
+
+    if not source_validation.get("success", False):
+        raise ValueError(
+            "The source file has a syntax error."
+        )
+
+    try:
+        ast.parse(test_code)
+    except SyntaxError as error:
+        raise ValueError(
+            f"The test file has a syntax error: {error}"
+        ) from error
+
+    safe_name = Path(file_name).name
+
+    if not safe_name.lower().endswith(".py"):
+        safe_name += ".py"
+
+    module_stem = Path(safe_name).stem
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", module_stem):
+        safe_name = "solution.py"
+
+    with tempfile.TemporaryDirectory(
+        prefix="debugengage_single_test_"
+    ) as temp_dir:
+
+        temp_root = Path(temp_dir)
+        tests_dir = temp_root / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+
+        (temp_root / safe_name).write_text(
+            source_code,
+            encoding="utf-8",
+        )
+
+        (tests_dir / "test_user_cases.py").write_text(
+            test_code,
+            encoding="utf-8",
+        )
+
+        return run_tests(temp_root, timeout=60)
+
+
+def compare_original_and_corrected(
+    original_code,
+    corrected_code,
+    file_name,
+    test_code,
+):
+    """
+    Run exactly the same test file against two independent
+    temporary project copies.
+    """
+
+    original_result = run_single_file_tests(
+        original_code,
+        file_name,
+        test_code,
+    )
+
+    corrected_result = run_single_file_tests(
+        corrected_code,
+        file_name,
+        test_code,
+    )
+
+    return {
+        "original": original_result,
+        "corrected": corrected_result,
+    }
+
+
+# ==========================================================
 # DIAGNOSIS DISPLAY
 # ==========================================================
 
 def show_diagnosis_summary(diagnosis):
-
     st.write(
         "**Diagnosis Status:**",
         diagnosis.get("status", "Not specified"),
@@ -237,9 +442,7 @@ def show_diagnosis_summary(diagnosis):
 
     st.write(
         "**Confidence:**",
-        format_confidence(
-            diagnosis.get("confidence")
-        ),
+        format_confidence(diagnosis.get("confidence")),
     )
 
     if diagnosis.get("ai_provider"):
@@ -248,39 +451,31 @@ def show_diagnosis_summary(diagnosis):
         )
 
     if diagnosis.get("recommended_action"):
-        st.info(
-            diagnosis["recommended_action"]
-        )
+        st.info(diagnosis["recommended_action"])
 
 
 def show_issue_details(diagnosis):
-
     issues = diagnosis.get("issues", [])
 
     if not issues:
         st.info(
             "No separate issue snippets were returned. "
-            "Review the complete corrected code and comparison."
+            "Review the complete corrected code."
         )
         return
 
     st.subheader("Detected Problems and Corrections")
 
     for index, issue in enumerate(issues, start=1):
-
         if isinstance(issue, str):
             issue = {"problem": issue}
 
-        title = issue.get(
-            "problem",
-            f"Issue {index}",
-        )
+        title = issue.get("problem", f"Issue {index}")
 
         if issue.get("line"):
             title += f" - Line {issue['line']}"
 
         with st.expander(title):
-
             st.write(
                 issue.get(
                     "explanation",
@@ -288,15 +483,8 @@ def show_issue_details(diagnosis):
                 )
             )
 
-            original = issue.get(
-                "original_snippet",
-                "",
-            )
-
-            corrected = issue.get(
-                "corrected_snippet",
-                "",
-            )
+            original = issue.get("original_snippet", "")
+            corrected = issue.get("corrected_snippet", "")
 
             if original:
                 st.markdown("**Original Code Section**")
@@ -318,45 +506,26 @@ def display_repair(
     file_name,
     key_prefix,
 ):
-
     show_diagnosis_summary(diagnosis)
 
-    status = diagnosis.get("status")
-
-    if status != "bug_found":
-
-        if status == "no_bug_found":
-            st.success(
-                "No source-code bug was identified."
-            )
-
-        elif status == "environment_issue":
+    if diagnosis.get("status") != "bug_found":
+        if diagnosis.get("status") == "no_bug_found":
+            st.success("No source-code bug was identified.")
+        elif diagnosis.get("status") == "environment_issue":
             st.warning(
-                "The issue appears to be related to the "
-                "environment, dependencies or configuration."
+                "The issue appears related to the environment, "
+                "dependencies or configuration."
             )
-
-        elif status == "insufficient_information":
-            st.warning(
-                "There is not enough information to provide "
-                "a reliable correction."
-            )
-
         else:
             st.warning(
                 "No valid corrected code was generated."
             )
-
         return False
 
     fixed_code = diagnosis.get("fixed_code", "")
 
     if not isinstance(fixed_code, str) or not fixed_code.strip():
-
-        st.error(
-            "Gemini did not return complete corrected code."
-        )
-
+        st.error("Gemini did not return complete corrected code.")
         return False
 
     validation = validate_python_code(
@@ -365,18 +534,10 @@ def display_repair(
     )
 
     if not validation.get("success", False):
-
-        st.error(
-            "Generated code failed Python syntax validation."
-        )
-
+        st.error("Generated code failed Python syntax validation.")
         st.code(
-            validation.get(
-                "error",
-                "Unknown syntax error.",
-            )
+            validation.get("error", "Unknown syntax error.")
         )
-
         return False
 
     show_issue_details(diagnosis)
@@ -386,15 +547,7 @@ def display_repair(
     )
 
     st.subheader("Complete Corrected Python Code")
-
-    st.caption(
-        "The complete corrected source file is shown below."
-    )
-
-    st.code(
-        fixed_code,
-        language="python",
-    )
+    st.code(fixed_code, language="python")
 
     st.download_button(
         label="Download Corrected Python File",
@@ -417,28 +570,18 @@ def display_repair(
     diff_text = "\n".join(diff)
 
     if diff_text:
-        st.code(
-            diff_text,
-            language="diff",
-        )
-
+        st.code(diff_text, language="diff")
     else:
-        st.info(
-            "No differences were detected."
-        )
+        st.info("No differences were detected.")
 
     return True
 
 
 # ==========================================================
-# TEST RESULTS
+# TEST RESULTS DISPLAY
 # ==========================================================
 
-def show_test_results(
-    result,
-    heading="Test Results",
-):
-
+def show_test_results(result, heading="Test Results"):
     st.subheader(heading)
 
     if not result:
@@ -460,46 +603,138 @@ def show_test_results(
     total = passed + failed + errors
 
     if result.get("timed_out"):
-
         st.error("Test execution timed out.")
 
     elif result.get("no_tests") or total == 0:
+        st.warning("No tests were collected.")
 
-        st.warning(
-            "No tests were collected. "
-            "The project has not been validated."
-        )
-
-    elif result.get("success") and failed == 0 and errors == 0:
-
-        st.success(
-            "All collected tests passed."
-        )
+    elif (
+        result.get("success")
+        and failed == 0
+        and errors == 0
+    ):
+        st.success("All collected tests passed.")
 
     else:
-
-        st.error(
-            "Some tests failed or produced errors."
-        )
+        st.error("Some tests failed or produced errors.")
 
     with st.expander("View Test Execution Output"):
-
         st.code(
-            result.get(
-                "output",
-                "No output available.",
-            )
+            result.get("output", "No output available.")
         )
+
+
+def show_comparison_results(comparison):
+    st.header("📊 Original vs Corrected Code Comparison")
+
+    original = comparison["original"]
+    corrected = comparison["corrected"]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Original Code")
+        show_test_results(
+            original,
+            "Original Code Test Results",
+        )
+
+    with col2:
+        st.subheader("Corrected Code")
+        show_test_results(
+            corrected,
+            "Corrected Code Test Results",
+        )
+
+    original_passed = original.get("passed", 0)
+    corrected_passed = corrected.get("passed", 0)
+
+    original_total = (
+        original.get("passed", 0)
+        + original.get("failed", 0)
+        + original.get("errors", 0)
+    )
+
+    corrected_total = (
+        corrected.get("passed", 0)
+        + corrected.get("failed", 0)
+        + corrected.get("errors", 0)
+    )
+
+    st.divider()
+    st.subheader("Comparison Summary")
+
+    metric1, metric2, metric3 = st.columns(3)
+
+    metric1.metric(
+        "Original Tests Passed",
+        original_passed,
+    )
+
+    metric2.metric(
+        "Corrected Tests Passed",
+        corrected_passed,
+    )
+
+    metric3.metric(
+        "Additional Tests Passed",
+        corrected_passed - original_passed,
+    )
+
+    if original_total == 0 or corrected_total == 0:
+        st.warning(
+            "Comparison is inconclusive because one or both "
+            "test runs collected no tests."
+        )
+
+    elif (
+        corrected.get("timed_out")
+        or original.get("timed_out")
+    ):
+        st.warning(
+            "Comparison is inconclusive because a test run timed out."
+        )
+
+    elif (
+        corrected.get("success")
+        and corrected.get("failed", 0) == 0
+        and corrected.get("errors", 0) == 0
+    ):
+        if (
+            original.get("failed", 0) > 0
+            or original.get("errors", 0) > 0
+        ):
+            st.success(
+                "The corrected version passed all collected tests, "
+                "while the original version had failures."
+            )
+        else:
+            st.success(
+                "Both versions passed all collected tests. "
+                "The generated tests did not demonstrate a failure "
+                "in the original version."
+            )
+
+    else:
+        st.warning(
+            "The corrected version still has failing tests or errors. "
+            "Review the test output before accepting the repair."
+        )
+
+    st.caption(
+        "The same test file was executed independently against "
+        "both code versions. Test results depend on the quality "
+        "and coverage of the generated or uploaded tests."
+    )
 
 
 # ==========================================================
 # APPLICATION HEADER AND NAVIGATION
 # ==========================================================
 
-st.title("🐞 Agentic AI Python Debugging System")
-
+st.title("🐞 DebugEngage AI")
 st.write(
-    "AI-powered Python debugging, code correction "
+    "Agentic AI Python debugging, code correction "
     "and automated test validation."
 )
 
@@ -510,12 +745,28 @@ page = st.sidebar.radio(
     [
         "Single Python Code",
         "Complete ZIP Project",
+        "Code Quality Analysis",
+        "AI Bug Explanation",
+        "Test Coverage Report",
+        "Debugging History",
+        "Original vs Corrected Comparison",
         "About",
     ],
 )
 
-st.sidebar.divider()
+# These feature pages must exist inside frontend/pages/.
+PAGE_PATHS = {
+    "Code Quality Analysis": "pages/Code_Quality.py",
+    "AI Bug Explanation": "pages/AI_Bug_Explanation.py",
+    "Test Coverage Report": "pages/Test_Coverage_Report.py",
+    "Debugging History": "pages/Debugging_History.py",
+    "Original vs Corrected Comparison": "pages/Original_vs_Corrected_Comparison.py",
+}
 
+if page in PAGE_PATHS:
+    st.switch_page(PAGE_PATHS[page])
+
+st.sidebar.divider()
 st.sidebar.caption(
     "Python Debugging and Test Automation"
 )
@@ -526,37 +777,31 @@ st.sidebar.caption(
 # ==========================================================
 
 if page == "About":
-
-    st.title("About the Project")
-
-    st.subheader(
-        "Agentic AI Python Debugging and Test Automation System"
-    )
+    st.title("About DebugEngage AI")
 
     st.write(
         """
-        This application helps developers identify and correct
-        Python programming errors using an AI debugging agent.
+        DebugEngage AI helps developers identify and correct
+        Python programming errors using AI-assisted debugging
+        and automated test validation.
 
-        The system supports individual Python files and
-        complete Python projects.
+        It supports individual Python files and complete
+        Python projects.
         """
     )
 
     st.subheader("Main Features")
 
     features = [
-        "Paste Python code directly",
-        "Upload individual Python files",
+        "Upload or paste individual Python files",
         "Upload complete ZIP projects",
-        "Python syntax and compilation validation",
+        "Python syntax validation",
         "AI-based bug diagnosis",
-        "Problematic section explanations",
         "Complete corrected source code",
         "Before-and-after code comparison",
-        "Corrected Python file download",
-        "Human approval before applying ZIP repairs",
-        "Automated pytest execution",
+        "Gemini-generated pytest tests",
+        "Original vs corrected test comparison",
+        "Human approval before ZIP repair",
         "Post-repair project validation",
     ]
 
@@ -564,7 +809,6 @@ if page == "About":
         st.write(f"✓ {feature}")
 
     st.subheader("Technology Stack")
-
     st.write(
         """
         - Python
@@ -578,7 +822,7 @@ if page == "About":
     st.warning(
         "Security: This prototype does not provide a secure sandbox. "
         "Uploaded project tests execute on the computer running "
-        "the application. Only run projects you trust."
+        "the application. Only run projects and tests you trust."
     )
 
 
@@ -601,32 +845,20 @@ elif page == "Single Python Code":
     )
 
     if uploaded_file is not None:
-
         try:
-
             uploaded_code = uploaded_file.getvalue().decode(
                 "utf-8-sig"
             )
 
             if (
-                st.session_state.single_file_name
-                != uploaded_file.name
-                or st.session_state.single_source_code
-                != uploaded_code
+                st.session_state.single_file_name != uploaded_file.name
+                or st.session_state.single_source_code != uploaded_code
             ):
-
                 st.session_state.single_source_code = uploaded_code
-
-                st.session_state.single_file_name = (
-                    uploaded_file.name
-                )
-
-                st.session_state.single_diagnosis = None
-
-                st.session_state.single_validation = None
+                st.session_state.single_file_name = uploaded_file.name
+                reset_single_file_results()
 
         except UnicodeDecodeError:
-
             st.error(
                 "Unable to read the uploaded file. "
                 "Please use UTF-8 encoding."
@@ -662,7 +894,6 @@ elif page == "Single Python Code":
     col1, col2 = st.columns(2)
 
     with col1:
-
         diagnose_clicked = st.button(
             "Diagnose and Correct My Code",
             type="primary",
@@ -670,7 +901,6 @@ elif page == "Single Python Code":
         )
 
     with col2:
-
         st.button(
             "Clear Code",
             use_container_width=True,
@@ -678,7 +908,6 @@ elif page == "Single Python Code":
         )
 
     if source_code.strip():
-
         validation = validate_python_code(
             source_code,
             file_name,
@@ -687,13 +916,10 @@ elif page == "Single Python Code":
         st.subheader("Local Syntax Validation")
 
         if validation.get("success", False):
-
             st.success(
                 "Python syntax and compilation validation passed."
             )
-
         else:
-
             st.error(
                 validation.get(
                     "error",
@@ -702,28 +928,19 @@ elif page == "Single Python Code":
             )
 
     if diagnose_clicked:
-
         if not source_code.strip():
-
-            st.error(
-                "Please paste code or upload a Python file."
-            )
+            st.error("Please paste code or upload a Python file.")
 
         elif len(source_code) > 100000:
-
             st.error(
-                "The file exceeds the current 100,000-character "
-                "application limit. Divide it into smaller files."
+                "The file exceeds the 100,000-character limit."
             )
 
         else:
-
             try:
-
                 with st.spinner(
                     "Gemini is analyzing your Python code..."
                 ):
-
                     diagnosis = repair_code(
                         source_code,
                         error_output,
@@ -733,21 +950,21 @@ elif page == "Single Python Code":
                 st.session_state.single_diagnosis = diagnosis
                 st.session_state.single_file_name = file_name
 
-            except Exception as error:
+                st.session_state.single_test_code = ""
+                st.session_state.single_test_explanation = ""
+                st.session_state.single_test_result = None
+                st.session_state.single_comparison_result = None
 
-                st.error(
-                    f"Diagnosis failed: {error}"
-                )
+            except Exception as error:
+                st.error(f"Diagnosis failed: {error}")
 
     diagnosis = st.session_state.single_diagnosis
 
     if diagnosis:
-
         st.divider()
-
         st.header("🤖 AI Diagnosis and Correction")
 
-        display_repair(
+        repair_valid = display_repair(
             diagnosis=diagnosis,
             original_code=st.session_state.single_source_code,
             file_name=st.session_state.single_file_name,
@@ -755,10 +972,207 @@ elif page == "Single Python Code":
         )
 
         st.info(
-            "Single-file mode does not execute your submitted code "
-            "or modify your original local file. Download or copy "
-            "the corrected code after reviewing it."
+            "Single-file mode does not modify your original local file. "
+            "Review and download the corrected code before using it."
         )
+
+        # --------------------------------------------------
+        # SINGLE-FILE AUTOMATED TESTING AND COMPARISON
+        # --------------------------------------------------
+
+        st.divider()
+        st.header("🧪 Single-File Automated Testing")
+
+        st.write(
+            "Upload pytest tests or generate tests with Gemini. "
+            "Then compare the original and corrected versions."
+        )
+
+        st.warning(
+            "Security notice: pytest executes Python code on this "
+            "computer. This prototype is not a secure sandbox. "
+            "Only run code and tests that you trust."
+        )
+
+        test_mode = st.radio(
+            "Choose how to provide tests",
+            [
+                "Upload pytest file",
+                "Generate tests with Gemini",
+            ],
+            horizontal=True,
+            key="single_test_mode",
+        )
+
+        if test_mode == "Upload pytest file":
+            uploaded_test_file = st.file_uploader(
+                "Upload your pytest test file (.py)",
+                type=["py"],
+                key="single_pytest_upload",
+            )
+
+            if uploaded_test_file is not None:
+                try:
+                    uploaded_test_code = (
+                        uploaded_test_file.getvalue().decode(
+                            "utf-8-sig"
+                        )
+                    )
+
+                    if (
+                        st.session_state.single_test_code
+                        != uploaded_test_code
+                    ):
+                        st.session_state.single_test_code = uploaded_test_code
+                        st.session_state.single_test_explanation = (
+                            "Tests uploaded by the user."
+                        )
+                        st.session_state.single_test_result = None
+                        st.session_state.single_comparison_result = None
+
+                except UnicodeDecodeError:
+                    st.error(
+                        "The test file must use UTF-8 encoding."
+                    )
+
+        else:
+            st.caption(
+                "Gemini will inspect the original code, proposed "
+                "corrected code and diagnosis to create tests for "
+                "the intended behaviour."
+            )
+
+            if st.button(
+                "✨ Generate Comparison Tests with Gemini",
+                use_container_width=True,
+                disabled=not (
+                    source_code.strip()
+                    and repair_valid
+                ),
+                key="generate_comparison_tests",
+            ):
+                try:
+                    with st.spinner(
+                        "Gemini is generating comparison tests..."
+                    ):
+                        generated = generate_pytest_tests(
+                            original_code=source_code,
+                            corrected_code=diagnosis["fixed_code"],
+                            file_name=file_name,
+                            diagnosis=diagnosis,
+                        )
+
+                    st.session_state.single_test_code = (
+                        generated["test_code"]
+                    )
+
+                    st.session_state.single_test_explanation = (
+                        generated["explanation"]
+                    )
+
+                    st.session_state.single_test_result = None
+                    st.session_state.single_comparison_result = None
+
+                    st.success(
+                        "Comparison tests generated. "
+                        "Review them before execution."
+                    )
+
+                except Exception as error:
+                    st.error(
+                        f"Test generation failed: {error}"
+                    )
+
+        if st.session_state.single_test_code:
+            st.subheader("Review Pytest Test Code")
+
+            if st.session_state.single_test_explanation:
+                st.info(
+                    st.session_state.single_test_explanation
+                )
+
+            edited_test_code = st.text_area(
+                "Test code (review or edit before execution)",
+                value=st.session_state.single_test_code,
+                height=300,
+                key="single_test_code_editor",
+            )
+
+            st.session_state.single_test_code = edited_test_code
+
+            authorize_single_tests = st.checkbox(
+                "I understand that pytest executes the source and "
+                "test code on this computer, and I trust both files.",
+                key="authorize_single_file_tests",
+            )
+
+            st.caption(
+                "Both versions are run in separate temporary folders. "
+                "The same test file is used for both runs."
+            )
+
+            if st.button(
+                "▶ Compare Original vs Corrected Code",
+                type="primary",
+                use_container_width=True,
+                disabled=not (
+                    authorize_single_tests
+                    and repair_valid
+                    and bool(edited_test_code.strip())
+                ),
+                key="compare_single_file_versions",
+            ):
+                try:
+                    with st.spinner(
+                        "Running the same pytest tests against both versions..."
+                    ):
+                        comparison = compare_original_and_corrected(
+                            original_code=source_code,
+                            corrected_code=diagnosis["fixed_code"],
+                            file_name=file_name,
+                            test_code=edited_test_code,
+                        )
+
+                    st.session_state.single_comparison_result = comparison
+
+                except Exception as error:
+                    st.session_state.single_comparison_result = None
+                    st.error(
+                        f"Code comparison failed: {error}"
+                    )
+
+            if st.session_state.single_comparison_result:
+                show_comparison_results(
+                    st.session_state.single_comparison_result
+                )
+
+            if st.button(
+                "▶ Run Tests Against Original Code Only",
+                disabled=not authorize_single_tests,
+                key="run_original_only",
+            ):
+                try:
+                    with st.spinner(
+                        "Running tests against original code..."
+                    ):
+                        result = run_single_file_tests(
+                            source_code,
+                            file_name,
+                            edited_test_code,
+                        )
+
+                    st.session_state.single_test_result = result
+
+                except Exception as error:
+                    st.error(
+                        f"Test execution failed: {error}"
+                    )
+
+            if st.session_state.single_test_result:
+                show_test_results(
+                    st.session_state.single_test_result,
+                    "Original Code Test Results",
+                )
 
 
 # ==========================================================
@@ -787,13 +1201,11 @@ elif page == "Complete ZIP Project":
     )
 
     if uploaded_zip is not None:
-
         if st.button(
             "Extract and Analyze Project",
             type="primary",
             use_container_width=True,
         ):
-
             reset_project_state()
 
             workspace = tempfile.mkdtemp(
@@ -801,32 +1213,29 @@ elif page == "Complete ZIP Project":
             )
 
             try:
-
                 with st.spinner("Extracting project..."):
-
-                    extract_project_zip(
+                    project_path = extract_project_zip(
                         uploaded_zip,
                         workspace,
                     )
 
-                project_path = Path(workspace) / "project"
+                project_path = Path(project_path).resolve()
 
-                if not project_path.exists():
-
+                if (
+                    not project_path.exists()
+                    or not project_path.is_dir()
+                ):
                     raise FileNotFoundError(
                         "Extracted project folder was not found."
                     )
 
                 with st.spinner("Analyzing project..."):
-
                     analysis_results = analyze_project(
                         project_path
                     )
 
                 st.session_state.workspace = workspace
-
                 st.session_state.project_path = str(project_path)
-
                 st.session_state.analysis_results = analysis_results
 
                 st.session_state.last_test_result = None
@@ -840,12 +1249,7 @@ elif page == "Complete ZIP Project":
                 )
 
             except Exception as error:
-
-                shutil.rmtree(
-                    workspace,
-                    ignore_errors=True,
-                )
-
+                shutil.rmtree(workspace, ignore_errors=True)
                 st.error(
                     f"Project extraction or analysis failed: {error}"
                 )
@@ -865,7 +1269,6 @@ elif page == "Complete ZIP Project":
         )
 
         st.divider()
-
         st.header("📊 Project Analysis Results")
 
         python_files = get_project_files(project_path)
@@ -878,34 +1281,20 @@ elif page == "Complete ZIP Project":
 
         col1, col2, col3 = st.columns(3)
 
-        col1.metric(
-            "Python Files",
-            len(python_files),
-        )
-
-        col2.metric(
-            "Test Files",
-            len(test_files),
-        )
-
+        col1.metric("Python Files", len(python_files))
+        col2.metric("Test Files", len(test_files))
         col3.metric(
             "Syntax Errors",
             len(results.get("syntax_errors", [])),
         )
 
         with st.expander("View Python Files"):
-
             for path in python_files:
-
                 st.write(
-                    get_relative_path(
-                        path,
-                        project_path,
-                    )
+                    get_relative_path(path, project_path)
                 )
 
         with st.expander("View Project Analysis Details"):
-
             st.json(results)
 
         # --------------------------------------------------
@@ -913,7 +1302,6 @@ elif page == "Complete ZIP Project":
         # --------------------------------------------------
 
         st.divider()
-
         st.header("🧪 Automated Project Testing")
 
         allow_tests = st.checkbox(
@@ -927,18 +1315,19 @@ elif page == "Complete ZIP Project":
             disabled=not allow_tests,
             use_container_width=True,
         ):
-
             try:
-
                 with st.spinner("Running pytest..."):
-
                     test_result = run_tests(
                         project_path,
                         timeout=60,
                     )
 
                 st.session_state.last_test_result = test_result
-                st.session_state.pop("zip_selected_python_file", None)
+
+                st.session_state.pop(
+                    "zip_selected_python_file",
+                    None,
+                )
 
                 st.session_state.repair_result = None
                 st.session_state.repair_file = None
@@ -946,26 +1335,26 @@ elif page == "Complete ZIP Project":
                 st.session_state.post_repair_result = None
 
             except Exception as error:
-
                 st.error(
                     f"Test execution failed: {error}"
                 )
 
         if st.session_state.last_test_result:
-
             show_test_results(
                 st.session_state.last_test_result,
                 "Initial Project Test Results",
             )
 
         # --------------------------------------------------
-        # AUTOMATIC FAILURE ANALYSIS AND SOURCE FILE SELECTION
+        # AUTOMATIC FAILURE ANALYSIS
         # --------------------------------------------------
 
         st.divider()
         st.header("🤖 AI Project File Diagnosis")
 
-        test_result = st.session_state.last_test_result or {}
+        test_result = (
+            st.session_state.last_test_result or {}
+        )
 
         source_files = [
             path for path in python_files
@@ -985,13 +1374,28 @@ elif page == "Complete ZIP Project":
                 for path in source_files
             ]
 
-            failed_test_files = test_result.get("failed_test_files", [])
-            imported_source_files = test_result.get("imported_source_files", [])
-            candidate_source_files = test_result.get("candidate_source_files", [])
-            failure_details = test_result.get("failure_details", [])
+            failed_test_files = test_result.get(
+                "failed_test_files", []
+            )
+
+            imported_source_files = test_result.get(
+                "imported_source_files", []
+            )
+
+            candidate_source_files = test_result.get(
+                "candidate_source_files", []
+            )
+
+            failure_details = test_result.get(
+                "failure_details", []
+            )
 
             def normalize_path(value):
-                return str(value).replace("\\", "/").lstrip("./")
+                return (
+                    str(value)
+                    .replace("\\", "/")
+                    .lstrip("./")
+                )
 
             normalized_candidates = {
                 normalize_path(item)
@@ -1001,7 +1405,8 @@ elif page == "Complete ZIP Project":
             matching_candidates = [
                 relative_file
                 for relative_file in relative_files
-                if normalize_path(relative_file) in normalized_candidates
+                if normalize_path(relative_file)
+                in normalized_candidates
             ]
 
             st.subheader("Automatic Failure Analysis")
@@ -1013,7 +1418,7 @@ elif page == "Complete ZIP Project":
                         st.write(f"• `{item}`")
                 else:
                     st.info(
-                        "No failed test files were identified in the latest test result."
+                        "No failed test files were identified."
                     )
 
                 if imported_source_files:
@@ -1023,23 +1428,28 @@ elif page == "Complete ZIP Project":
 
                 if matching_candidates:
                     st.success(
-                        "Likely source files identified using test failure and import analysis."
+                        "Likely source files identified using "
+                        "test failure and import analysis."
                     )
                     for item in matching_candidates:
                         st.write(f"• `{item}`")
                 else:
                     st.info(
-                        "No matching candidate source file was identified. "
-                        "You can select a source file manually."
+                        "No matching candidate source file was "
+                        "identified. You can select a file manually."
                     )
             else:
                 st.info(
-                    "Run project tests first to identify failed tests and likely source files."
+                    "Run project tests first to identify failed "
+                    "tests and likely source files."
                 )
 
             default_index = 0
+
             if matching_candidates:
-                default_index = relative_files.index(matching_candidates[0])
+                default_index = relative_files.index(
+                    matching_candidates[0]
+                )
 
             selected_file = st.selectbox(
                 "Select Python File to Diagnose",
@@ -1049,19 +1459,29 @@ elif page == "Complete ZIP Project":
             )
 
             try:
-                selected_path = resolve_project_file(project_path, selected_file)
-                original_code = selected_path.read_text(encoding="utf-8-sig")
+                selected_path = resolve_project_file(
+                    project_path,
+                    selected_file,
+                )
+
+                original_code = selected_path.read_text(
+                    encoding="utf-8-sig"
+                )
 
                 st.caption(
-                    f"Selected file size: {len(original_code):,} characters"
+                    f"Selected file size: "
+                    f"{len(original_code):,} characters"
                 )
 
                 with st.expander("View Original Source Code"):
                     st.code(original_code, language="python")
 
             except Exception as error:
-                st.error(f"Unable to read selected file: {error}")
+                st.error(
+                    f"Unable to read selected file: {error}"
+                )
                 original_code = ""
+                selected_path = None
 
             # ----------------------------------------------
             # GEMINI DIAGNOSIS
@@ -1073,12 +1493,16 @@ elif page == "Complete ZIP Project":
                 use_container_width=True,
             ):
                 if not original_code.strip():
-                    st.error("The selected Python file is empty or unreadable.")
+                    st.error(
+                        "The selected Python file is empty or unreadable."
+                    )
+
                 elif len(original_code) > 100000:
                     st.error(
-                        "This file exceeds the current 100,000-character "
-                        "application limit. Divide it into smaller files."
+                        "This file exceeds the 100,000-character "
+                        "application limit."
                     )
+
                 else:
                     try:
                         test_output = get_test_output(
@@ -1099,7 +1523,7 @@ elif page == "Complete ZIP Project":
                         )
 
                         with st.spinner(
-                            "Gemini is analyzing the selected source file and test failures..."
+                            "Gemini is analyzing the selected file..."
                         ):
                             diagnosis = repair_code(
                                 original_code,
@@ -1108,12 +1532,17 @@ elif page == "Complete ZIP Project":
                             )
 
                         st.session_state.repair_result = diagnosis
-                        st.session_state.repair_file = str(selected_path.resolve())
+                        st.session_state.repair_file = str(
+                            selected_path.resolve()
+                        )
+
                         st.session_state.repair_applied = False
                         st.session_state.post_repair_result = None
 
                     except Exception as error:
-                        st.error(f"Gemini diagnosis failed: {error}")
+                        st.error(
+                            f"Gemini diagnosis failed: {error}"
+                        )
 
             # ----------------------------------------------
             # PROJECT DIAGNOSIS DISPLAY
@@ -1123,21 +1552,19 @@ elif page == "Complete ZIP Project":
 
             if (
                 diagnosis
+                and selected_path is not None
                 and st.session_state.repair_file
                 == str(selected_path.resolve())
             ):
 
                 st.divider()
-
                 st.header("🧠 Project Diagnosis Results")
 
                 try:
-
                     selected_path = Path(
                         st.session_state.repair_file
                     ).resolve()
 
-                    # Ensure target remains inside extracted project.
                     selected_path.relative_to(
                         project_path.resolve()
                     )
@@ -1154,11 +1581,9 @@ elif page == "Complete ZIP Project":
                     )
 
                     if repair_is_valid:
-
                         fixed_code = diagnosis["fixed_code"]
 
                         st.divider()
-
                         st.subheader(
                             "Approve and Apply Correction"
                         )
@@ -1170,15 +1595,12 @@ elif page == "Complete ZIP Project":
                         )
 
                         if not st.session_state.repair_applied:
-
                             if st.button(
                                 "Approve and Apply Repair",
                                 type="primary",
                                 key="approve_zip_repair",
                             ):
-
                                 try:
-
                                     current_target = Path(
                                         st.session_state.repair_file
                                     ).resolve()
@@ -1193,10 +1615,8 @@ elif page == "Complete ZIP Project":
                                     )
 
                                     if not validation.get(
-                                        "success",
-                                        False,
+                                        "success", False
                                     ):
-
                                         raise ValueError(
                                             "Corrected code failed "
                                             "syntax validation."
@@ -1208,7 +1628,6 @@ elif page == "Complete ZIP Project":
                                     )
 
                                     st.session_state.repair_applied = True
-
                                     st.session_state.post_repair_result = None
 
                                     st.success(
@@ -1221,13 +1640,11 @@ elif page == "Complete ZIP Project":
                                     )
 
                                 except Exception as error:
-
                                     st.error(
                                         f"Could not apply repair: {error}"
                                     )
 
                         else:
-
                             st.success(
                                 "Approved repair has been applied."
                             )
@@ -1237,9 +1654,7 @@ elif page == "Complete ZIP Project":
                         # ----------------------------------
 
                         if st.session_state.repair_applied:
-
                             st.divider()
-
                             st.header(
                                 "🔄 Post-Repair Test Validation"
                             )
@@ -1259,13 +1674,10 @@ elif page == "Complete ZIP Project":
                                 disabled=not authorize_post_tests,
                                 key="run_post_repair_tests",
                             ):
-
                                 try:
-
                                     with st.spinner(
                                         "Validating repaired project..."
                                     ):
-
                                         validation_result = run_tests(
                                             project_path,
                                             timeout=60,
@@ -1276,14 +1688,12 @@ elif page == "Complete ZIP Project":
                                     )
 
                                 except Exception as error:
-
                                     st.error(
                                         "Post-repair test execution failed: "
                                         f"{error}"
                                     )
 
                             if st.session_state.post_repair_result:
-
                                 validation_result = (
                                     st.session_state.post_repair_result
                                 )
@@ -1305,21 +1715,17 @@ elif page == "Complete ZIP Project":
                                     and validation_result.get("failed", 0) == 0
                                     and validation_result.get("errors", 0) == 0
                                 ):
-
                                     st.success(
                                         "Repair successfully validated. "
                                         "All collected tests passed."
                                     )
-
                                 else:
-
                                     st.warning(
                                         "The repair is not fully validated. "
                                         "Review the test output."
                                     )
 
                 except Exception as error:
-
                     st.error(
                         f"Could not display project diagnosis: {error}"
                     )
