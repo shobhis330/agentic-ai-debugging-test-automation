@@ -1,0 +1,20 @@
+[
+    {
+        "id": "TC01",
+        "bug_type": "Off-by-one error",
+        "function_name": "calculate_average",
+        "buggy_code": "def calculate_average(numbers):\n    total = sum(numbers)\n    return total / (len(numbers) - 1)\n"
+    },
+    {
+        "id": "TC02",
+        "bug_type": "Incorrect conditional logic",
+        "function_name": "is_adult",
+        "buggy_code": "def is_adult(age):\n    return age > 18\n"
+    },
+    {
+        "id": "TC03",
+        "bug_type": "Undefined variable",
+        "function_name": "calculate_total",
+        "buggy_code": "def calculate_total(prices):\n    total = sum(price for price in prices)\n    return tota\n"
+    }
+]

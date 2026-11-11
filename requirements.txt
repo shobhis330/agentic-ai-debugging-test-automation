@@ -1,0 +1,7 @@
+﻿google-genai
+pytest
+streamlit
+pandas
+plotly
+python-dotenv
+coverage
