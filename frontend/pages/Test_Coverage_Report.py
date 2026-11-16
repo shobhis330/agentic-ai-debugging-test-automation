@@ -51,7 +51,10 @@ defaults = {
     "coverage_test_explanation": "",
     "coverage_result": None,
     "coverage_last_source": "",
-    "coverage_last_file": ""
+    "coverage_last_file": "",
+    "coverage_last_source_identity": None,
+    "coverage_last_version": "",
+    "coverage_result_version": ""
 }
 
 for key, value in defaults.items():
@@ -65,66 +68,131 @@ for key, value in defaults.items():
 
 st.subheader("1. Python Source Code")
 
-input_method = st.radio(
-    "Choose code input method",
-    ["Upload Python File", "Paste Python Code"],
-    horizontal=True,
-    key="coverage_input_method"
+shared_original_source = st.session_state.get("central_original_code") or ""
+shared_corrected_source = st.session_state.get("central_corrected_code") or ""
+shared_name = (
+    st.session_state.get("central_selected_file")
+    or st.session_state.get("central_upload_name")
+    or "solution.py"
 )
+shared_path = st.session_state.get("project_path")
+coverage_source_rel_path = st.session_state.get("central_selected_file") or ""
+coverage_project_root = shared_path if shared_path and shared_original_source else None
+coverage_test_rel_path = None
+coverage_uses_shared_project = bool(
+    shared_original_source.strip()
+    and coverage_project_root
+    and coverage_source_rel_path
+)
+coverage_version_label = "Original Code"
+source_code = shared_original_source
+file_name = shared_name
 
-source_code = ""
-file_name = "solution.py"
+if coverage_uses_shared_project:
+    version_options = ["Original Code"]
+    if shared_corrected_source.strip():
+        version_options.append("Corrected Code")
 
-if input_method == "Upload Python File":
-
-    uploaded_file = st.file_uploader(
-        "Upload your Python source file",
-        type=["py"],
-        key="coverage_source_upload"
+    selected_version = st.radio(
+        "Choose which code version to test",
+        version_options,
+        horizontal=True,
+        key="coverage_code_version",
+        help="The same pytest test cases are used for either version."
     )
+    if selected_version == "Corrected Code":
+        source_code = shared_corrected_source
+        coverage_version_label = "Corrected Code"
+    else:
+        source_code = shared_original_source
+        coverage_version_label = "Original Code"
 
-    if uploaded_file is not None:
-        source_code = uploaded_file.getvalue().decode(
-            "utf-8-sig",
-            errors="replace"
-        )
-        file_name = uploaded_file.name
-
-        st.success(f"Loaded: {file_name}")
-
+    st.success(f"Using shared debugging session: {file_name}")
+    st.info(
+        f"Selected version: **{coverage_version_label}**. "
+        "The original and corrected versions are tested separately in an isolated temporary copy. "
+        "Your uploaded project files are not overwritten."
+    )
 else:
+    source_code = ""
+    if shared_path:
+        candidates = sorted(Path(shared_path).rglob("*.py"))
+        ignored = {
+            ".venv", "venv", ".git", "node_modules",
+            "__pycache__", ".pytest_cache"
+        }
+        candidates = [
+            p for p in candidates
+            if not any(part.lower() in ignored for part in p.parts)
+        ]
+        candidates = [
+            p for p in candidates
+            if not (
+                p.name.lower().startswith("test_")
+                or p.name.lower().endswith("_test.py")
+            )
+        ]
+        if candidates:
+            labels = [p.relative_to(shared_path).as_posix() for p in candidates]
+            selected = st.selectbox(
+                "Python file from uploaded project",
+                labels,
+                key="coverage_shared_file_v3"
+            )
+            chosen = candidates[labels.index(selected)]
+            source_code = chosen.read_text(encoding="utf-8-sig", errors="replace")
+            file_name = chosen.name
+            coverage_source_rel_path = selected
+            coverage_project_root = shared_path
+            coverage_uses_shared_project = True
+            coverage_version_label = "Project Source"
 
-    file_name = st.text_input(
-        "Python file name",
-        value="solution.py",
-        key="coverage_source_filename"
+    if source_code.strip():
+        st.success(f"Using project source: {file_name}")
+    else:
+        st.info(
+            "No main project is uploaded yet. Upload a ZIP project or use "
+            "Single Python Code first."
+        )
+
+with st.expander("Use a different file for Test Coverage (optional)"):
+    local_file = st.file_uploader(
+        "Upload a Python file for this coverage report only",
+        type=["py"],
+        key="coverage_local_upload_v3"
     )
-
-    if not file_name.strip():
-        file_name = "solution.py"
-
-    if not file_name.lower().endswith(".py"):
-        file_name += ".py"
-
-    source_code = st.text_area(
-        "Paste your Python source code",
-        height=300,
-        placeholder="Paste your Python code here...",
-        key="coverage_source_code"
-    )
+    if local_file is not None:
+        source_code = local_file.getvalue().decode("utf-8-sig", errors="replace")
+        file_name = local_file.name
+        coverage_project_root = None
+        coverage_source_rel_path = None
+        coverage_test_rel_path = None
+        coverage_uses_shared_project = False
+        coverage_version_label = "Uploaded File"
+        st.info(f"Using separate file for this feature only: {file_name}")
 
 
-# Clear old results when the source changes.
-if (
-    source_code != st.session_state.coverage_last_source
-    or file_name != st.session_state.coverage_last_file
-):
+# Clear tests only when the selected source file changes.
+# Switching Original/Corrected must preserve the exact same test suite.
+source_identity = (
+    coverage_source_rel_path or file_name,
+    file_name,
+    shared_original_source if (coverage_uses_shared_project and shared_original_source) else source_code,
+)
+if source_identity != st.session_state.coverage_last_source_identity:
     st.session_state.coverage_result = None
     st.session_state.coverage_test_code = ""
     st.session_state.coverage_test_explanation = ""
+    st.session_state.coverage_last_source_identity = source_identity
 
-    st.session_state.coverage_last_source = source_code
-    st.session_state.coverage_last_file = file_name
+# A result belongs to one code version only. Never display an Original
+# result while Corrected Code is selected, or vice versa.
+if coverage_version_label != st.session_state.coverage_last_version:
+    st.session_state.coverage_result = None
+    st.session_state.coverage_last_version = coverage_version_label
+
+st.session_state.coverage_last_source = source_code
+st.session_state.coverage_last_file = file_name
 
 
 st.divider()
@@ -138,13 +206,52 @@ st.subheader("2. Provide Pytest Test Cases")
 
 test_method = st.radio(
     "Choose how to provide test cases",
-    ["Generate Tests with Gemini", "Upload Test File"],
+    ["Reuse Tests from Shared Project", "Generate Tests with Gemini", "Upload Test File"],
     horizontal=True,
-    key="coverage_test_method"
+    key="coverage_test_method_v2"
 )
 
+if test_method == "Reuse Tests from Shared Project":
+    shared_test_files = []
+    if shared_path:
+        shared_root = Path(shared_path)
+        shared_test_files = sorted(
+            p for p in shared_root.rglob("*.py")
+            if (p.name.lower().startswith("test_") or p.name.lower().endswith("_test.py"))
+            and not any(part.lower() in {".venv", "venv", ".git", "node_modules", "__pycache__", ".pytest_cache"} for part in p.parts)
+        )
+    if shared_test_files:
+        test_labels = [p.relative_to(shared_path).as_posix() for p in shared_test_files]
+        selected_test = st.selectbox("Select an existing project test file", test_labels, key="coverage_shared_test_file")
+        chosen_test = shared_test_files[test_labels.index(selected_test)]
+        coverage_test_rel_path = selected_test
+        reused_test_code = chosen_test.read_text(encoding="utf-8-sig", errors="replace")
+        if reused_test_code != st.session_state.coverage_test_code:
+            st.session_state.coverage_test_code = reused_test_code
+            st.session_state.coverage_test_explanation = f"Reused from uploaded project: {selected_test}"
+            st.session_state.coverage_result = None
+        st.success(f"Using tests from the shared project: {selected_test}")
+    else:
+        shared_generated_tests = st.session_state.get("central_test_code") or ""
+        same_shared_source = (
+            coverage_uses_shared_project
+            and bool(shared_original_source.strip())
+            and bool(st.session_state.get("central_test_code"))
+        )
+        if same_shared_source and shared_generated_tests.strip():
+            if st.session_state.coverage_test_code != shared_generated_tests:
+                st.session_state.coverage_test_code = shared_generated_tests
+                st.session_state.coverage_test_explanation = (
+                    st.session_state.get("central_test_explanation")
+                    or "Reused AI-generated pytest tests from the shared debugging workflow."
+                )
+                st.session_state.coverage_result = None
+            st.success("Reusing AI-generated pytest tests from Original vs Corrected Comparison.")
+            st.caption("The exact same test cases are retained when you switch between Original Code and Corrected Code.")
+        else:
+            st.info("No pytest files or reusable generated tests were found in the shared project. Choose Generate Tests with Gemini or Upload Test File.")
 
-if test_method == "Generate Tests with Gemini":
+elif test_method == "Generate Tests with Gemini":
 
     st.write(
         "Gemini will inspect your source code and generate "
@@ -171,6 +278,10 @@ if test_method == "Generate Tests with Gemini":
                 generated["explanation"]
             )
             st.session_state.coverage_result = None
+            # Keep generated tests available to the comparison workflow too.
+            if coverage_uses_shared_project:
+                st.session_state.central_test_code = generated["test_code"]
+                st.session_state.central_test_explanation = generated["explanation"]
 
             st.success("Test cases generated successfully.")
 
@@ -226,6 +337,8 @@ if st.session_state.coverage_test_code:
     )
 
     st.session_state.coverage_test_code = edited_test_code
+    if coverage_uses_shared_project:
+        st.session_state.central_test_code = edited_test_code
 
     st.download_button(
         "⬇️ Download Test Cases",
@@ -266,10 +379,14 @@ if st.session_state.coverage_test_code:
                     source_code=source_code,
                     file_name=file_name,
                     test_code=edited_test_code,
-                    timeout=60
+                    timeout=60,
+                    project_root=coverage_project_root,
+                    source_rel_path=coverage_source_rel_path,
+                    test_rel_path=coverage_test_rel_path,
                 )
 
             st.session_state.coverage_result = result
+            st.session_state.coverage_result_version = coverage_version_label
 
         except Exception as error:
             st.session_state.coverage_result = None
@@ -286,6 +403,11 @@ if result:
 
     st.divider()
     st.header("📊 Test Coverage Results")
+    result_version = (
+        st.session_state.get("coverage_result_version")
+        or coverage_version_label
+    )
+    st.info(f"Code version tested: **{result_version}**")
 
     passed = result["passed"]
     failed = result["failed"]
@@ -408,6 +530,7 @@ if result:
     # Download report
     report_data = {
         "file_name": file_name,
+        "code_version": result_version,
         "passed": passed,
         "failed": failed,
         "errors": errors,
@@ -426,6 +549,7 @@ if result:
     )
 
     st.caption(
+        "The selected code version is tested using the same pytest test cases. "
         "Coverage indicates which executable lines were run. "
         "It does not measure whether assertions are correct or "
         "whether every possible behaviour is tested."
