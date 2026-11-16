@@ -3,6 +3,52 @@ import streamlit as st
 
 from core.test_comparison import compare_versions
 
+
+def synchronize_test_imports(test_source: str, python_filename: str):
+    """Update a single unambiguous project-module import to match the filename."""
+    module_name = Path(python_filename).stem
+    try:
+        tree = ast.parse(test_source)
+    except SyntaxError as exc:
+        return test_source, [], f"Test code has a syntax error: {exc}"
+
+    ignored = {"pytest", "unittest", "typing", "pathlib", "os", "sys", "math", "json", "re", "collections"}
+    candidates = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".")[0]
+            if root not in ignored:
+                candidates.add(node.module)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root not in ignored:
+                    candidates.add(alias.name)
+
+    if not candidates:
+        return test_source, [], None
+    if len(candidates) != 1:
+        return test_source, [], "More than one non-standard module import was found; imports were left unchanged to avoid modifying the wrong module."
+
+    old_module = next(iter(candidates))
+    if old_module == module_name:
+        return test_source, [], None
+
+    # Replace only the module token in import statements, preserving imported names and aliases.
+    updated = re.sub(
+        rf"(?m)^(\s*from\s+){re.escape(old_module)}(\s+import\b)",
+        rf"\g<1>{module_name}\g<2>",
+        test_source,
+    )
+    updated = re.sub(
+        rf"(?m)^(\s*import\s+){re.escape(old_module)}(\s*(?:as\s+\w+)?\s*(?:,|$))",
+        rf"\g<1>{module_name}\g<2>",
+        updated,
+    )
+    if updated == test_source:
+        return test_source, [], "The detected module import could not be safely rewritten."
+    return updated, [f"{old_module} → {module_name}"], None
+
 st.set_page_config(
     page_title="Original vs Corrected Comparison",
     page_icon="⚖️",
@@ -79,11 +125,21 @@ if st.button(
     elif not file_name.strip() or not file_name.endswith(".py"):
         st.error("Please enter a valid Python filename ending in .py.")
     else:
+        synchronized_test_code, import_changes, sync_warning = synchronize_test_imports(
+            test_code, file_name
+        )
+        if sync_warning:
+            st.warning(sync_warning)
+        if import_changes:
+            st.success("Test import synchronized automatically: " + ", ".join(import_changes))
+            with st.expander("View synchronized pytest code"):
+                st.code(synchronized_test_code, language="python")
+
         with st.spinner("Running tests against both code versions..."):
             result = compare_versions(
                 original_code,
                 corrected_code,
-                test_code,
+                synchronized_test_code,
                 file_name
             )
 
